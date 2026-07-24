@@ -1,70 +1,101 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from typing import List, Dict
 
-from models import TriageRequest, TriageResponse, ChronicReading, ChronicTrendResponse
-from rule_engine import run_triage, detect_unhealthy_trend
+from backend.models import TriageRequest, TriageResponse, ChronicLogRequest, ChronicLogResponse
+from backend.rule_engine import evaluate_triage
+from backend.llm_explainer import explain_triage
 
-app = FastAPI(
-    title="AI Health Companion API",
-    description="Safety-first symptom triage + chronic disease tracking for TetraTHON 2026",
-    version="0.1.0",
-)
+app = FastAPI(title="SahaySetu AI Health Companion API")
 
+# Setup CORS for the frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten before production
+    allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# In-memory store for the hackathon demo. Swap for SQLite/IndexedDB sync later.
-_READINGS: dict[str, list[float]] = {}
-
+# In-memory store for chronic logs: metric_name -> list of values
+chronic_logs_store: Dict[str, List[float]] = {}
 
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
 
-
 @app.post("/api/triage", response_model=TriageResponse)
-def triage(req: TriageRequest):
-    from llm_explainer import explain  # imported lazily so rule engine works with zero deps
+def perform_triage(request: TriageRequest):
+    try:
+        # 1. Deterministic Rule Engine Decision
+        # Ensure vitals is a dictionary if provided
+        vitals_dict = request.vitals.model_dump() if request.vitals else {}
+        triage_level = evaluate_triage(
+            symptoms=request.symptoms,
+            vitals=vitals_dict,
+            duration_days=request.duration_days
+        )
+        
+        # 2. LLM Explanation (or deterministic fallback)
+        explanation = explain_triage(
+            triage_level=triage_level,
+            symptoms=request.symptoms,
+            vitals=vitals_dict,
+            language=request.language
+        )
+        
+        return TriageResponse(
+            triage_level=triage_level,
+            explanation=explanation
+        )
+    except Exception as e:
+        # Fallback in case of absolute failure
+        return TriageResponse(
+            triage_level="RED",
+            explanation="An unexpected error occurred. Please seek medical attention immediately."
+        )
 
-    result = run_triage(
-        symptoms=req.symptoms,
-        vitals=req.vitals.model_dump(),
-        duration_days=req.duration_days,
-    )
-    explanation = explain(result, language=req.language)
+@app.post("/api/chronic/log", response_model=ChronicLogResponse)
+def log_chronic_metric(request: ChronicLogRequest):
+    metric = request.metric_name.lower()
+    
+    if metric not in chronic_logs_store:
+        chronic_logs_store[metric] = []
+        
+    chronic_logs_store[metric].append(request.value)
+    
+    readings = chronic_logs_store[metric]
+    
+    if len(readings) < 3:
+        return ChronicLogResponse(
+            trend_status="insufficient_data",
+            message=f"Logged successfully. Need {3 - len(readings)} more readings to establish a trend."
+        )
+        
+    # Take the last 3 readings
+    last_three = readings[-3:]
+    
+    # Simple logic for trend: 
+    # If it's increasing consecutively, mark as unhealthy (simplistic, for the hackathon).
+    # For actual clinical use, it depends on the metric (e.g. blood_sugar increasing is bad, spo2 decreasing is bad).
+    # Let's apply a generic variance or consecutive bad direction check.
+    # To keep it generic but safe: if the last 3 readings are strictly increasing, we call it out.
+    if last_three[0] < last_three[1] < last_three[2]:
+        return ChronicLogResponse(
+            trend_status="unhealthy",
+            message=f"Warning: Your {request.metric_name} readings show a consistent increasing trend."
+        )
+    elif last_three[0] > last_three[1] > last_three[2]:
+        return ChronicLogResponse(
+            trend_status="unhealthy",
+            message=f"Warning: Your {request.metric_name} readings show a consistent decreasing trend."
+        )
+    else:
+        return ChronicLogResponse(
+            trend_status="healthy",
+            message=f"Your recent {request.metric_name} readings appear stable."
+        )
 
-    return TriageResponse(
-        level=result.level.value,
-        confidence=result.confidence,
-        reason=result.reason,
-        red_flags=result.red_flags,
-        recommended_next_step=result.recommended_next_step,
-        explanation=explanation,
-    )
-
-
-@app.post("/api/chronic/log", response_model=ChronicTrendResponse)
-def log_chronic_reading(reading: ChronicReading):
-    target_by_metric = {"blood_sugar": 120.0, "systolic_bp": 120.0}
-    target = target_by_metric.get(reading.metric, reading.value)
-
-    _READINGS.setdefault(reading.metric, []).append(reading.value)
-    unhealthy = detect_unhealthy_trend(_READINGS[reading.metric], target=target)
-
-    message = (
-        f"Your last 3 {reading.metric.replace('_', ' ')} readings are consistently "
-        f"outside the healthy range. Consider mentioning this to your doctor."
-        if unhealthy else
-        f"{reading.metric.replace('_', ' ').title()} looks within a reasonable range."
-    )
-
-    return ChronicTrendResponse(
-        metric=reading.metric,
-        unhealthy_trend=unhealthy,
-        readings_considered=len(_READINGS[reading.metric]),
-        message=message,
-    )
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("backend.main:app", host="0.0.0.0", port=8000, reload=True)

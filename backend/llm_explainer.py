@@ -1,58 +1,71 @@
-"""
-llm_explainer.py
-Calls Gemini (or falls back to a template) to turn a TriageResult into a
-warm, plain-language explanation. This layer is explicitly NOT allowed to
-change the triage level — it only narrates. If the API key is missing or
-the call fails, we fall back to a deterministic template so the app still
-works fully offline.
-"""
-
 import os
-from rule_engine import TriageResult
+from google import genai
+from backend.models import Vitals
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# Initialize client if API key is available
+try:
+    client = genai.Client()
+except Exception:
+    client = None
 
-SYSTEM_INSTRUCTIONS = """You are a calm, plain-language health explainer.
-You are given a triage level that has ALREADY been decided by a clinical
-rule engine. Your only job is to explain WHY in simple words a 10-year-old
-could understand, in the requested language. You must NEVER:
-- change the triage level
-- suggest a diagnosis
-- suggest specific medication doses
-Keep it to 2-3 short sentences.
-"""
-
-
-def _template_fallback(result: TriageResult, language: str) -> str:
+def get_deterministic_explanation(triage_level: str, language: str) -> str:
+    """Fallback deterministic explanation when LLM is unavailable."""
+    # A simple dictionary for a few languages; default to English if not found
     templates = {
-        "GREEN": "This looks like something you can manage safely at home. "
-                 "Rest, drink fluids, and keep an eye on how you feel over the next day or two.",
-        "YELLOW": "This isn't an emergency, but it's worth having a doctor take a look "
-                  "within the next couple of days, just to be safe.",
-        "RED": "This combination of signs can be serious. Please get to a hospital "
-               "or call for emergency help right away — don't wait.",
+        "english": {
+            "RED": "Critical situation detected. Please visit a hospital immediately.",
+            "YELLOW": "Potential concern detected. Please consult a doctor within 48 hours.",
+            "GREEN": "No immediate critical concerns detected. Home care is sufficient."
+        },
+        "hindi": {
+            "RED": "गंभीर स्थिति का पता चला है। कृपया तुरंत अस्पताल जाएं।",
+            "YELLOW": "संभावित चिंता का पता चला है। कृपया 48 घंटे के भीतर डॉक्टर से सलाह लें।",
+            "GREEN": "कोई तत्काल महत्वपूर्ण चिंता नहीं पाई गई। घरेलू देखभाल पर्याप्त है।"
+        }
     }
-    return templates.get(result.level.value, "Please consult a healthcare professional.")
+    
+    lang_key = language.lower().strip()
+    if lang_key not in templates:
+        lang_key = "english"
+        
+    return templates[lang_key].get(triage_level, templates["english"][triage_level])
 
+def explain_triage(triage_level: str, symptoms: list[str], vitals: dict | Vitals, language: str) -> str:
+    """
+    Calls the Gemini API to explain the triage level in plain language.
+    Does NOT change the triage level.
+    Falls back to a deterministic string if it fails or API key is absent.
+    """
+    if not client:
+        return get_deterministic_explanation(triage_level, language)
+        
+    vitals_dict = vitals.model_dump() if hasattr(vitals, 'model_dump') else vitals
 
-def explain(result: TriageResult, language: str = "en") -> str:
-    if not GEMINI_API_KEY:
-        return _template_fallback(result, language)
-
+    prompt = f"""
+    You are an AI medical explainer. The clinical rule engine has already determined the patient's triage level as: {triage_level}.
+    Under NO CIRCUMSTANCES should you change this level or suggest a different level. Your only job is to explain why this decision was made in plain language, in {language}.
+    
+    Patient Data:
+    - Symptoms: {', '.join(symptoms) if symptoms else 'None provided'}
+    - Vitals: {vitals_dict}
+    
+    Triage meaning:
+    - RED: Visit hospital immediately.
+    - YELLOW: Consult doctor within 48 hours.
+    - GREEN: Home care.
+    
+    Keep the explanation brief, empathetic, and clear.
+    """
+    
     try:
-        import google.generativeai as genai
-
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        prompt = (
-            f"{SYSTEM_INSTRUCTIONS}\n\n"
-            f"Triage level: {result.level.value}\n"
-            f"Reason: {result.reason}\n"
-            f"Red flags: {', '.join(result.red_flags) or 'none'}\n"
-            f"Respond in language code: {language}\n"
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
         )
-        response = model.generate_content(prompt)
-        return response.text.strip()
-    except Exception:
-        # Network / quota / parsing failure -> fail safe to template, never crash
-        return _template_fallback(result, language)
+        if response and response.text:
+            return response.text.strip()
+        else:
+            return get_deterministic_explanation(triage_level, language)
+    except Exception as e:
+        print(f"LLM explanation failed: {e}")
+        return get_deterministic_explanation(triage_level, language)

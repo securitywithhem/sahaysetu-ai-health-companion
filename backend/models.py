@@ -1,38 +1,27 @@
 from pydantic import BaseModel, Field
-
+from typing import List, Optional
 
 class Vitals(BaseModel):
-    heart_rate: float | None = None
-    spo2: float | None = None
-    temperature_c: float | None = None
-    systolic_bp: float | None = None
-
+    heart_rate: Optional[int] = Field(None, description="Heart rate in bpm")
+    spo2: Optional[int] = Field(None, description="Blood oxygen saturation in %")
+    temperature: Optional[float] = Field(None, description="Body temperature in Celsius")
+    systolic_bp: Optional[int] = Field(None, description="Systolic blood pressure in mmHg")
 
 class TriageRequest(BaseModel):
-    symptoms: list[str] = Field(..., examples=[["fever", "cough"]])
-    vitals: Vitals = Vitals()
-    duration_days: float = 0
-    language: str = "en"  # for multilingual explanation, e.g. "hi", "fr"
-
+    symptoms: List[str] = Field(..., description="List of patient symptoms")
+    vitals: Optional[Vitals] = Field(None, description="Patient vital signs")
+    duration_days: int = Field(0, ge=0, description="Duration of symptoms in days")
+    language: str = Field("English", description="Preferred language for the explanation")
 
 class TriageResponse(BaseModel):
-    level: str
-    confidence: float
-    reason: str
-    red_flags: list[str]
-    recommended_next_step: str
-    explanation: str  # LLM-generated, plain-language narration
+    triage_level: str = Field(..., description="Triage level: RED, YELLOW, or GREEN")
+    explanation: str = Field(..., description="Plain-language explanation of the triage result")
 
+class ChronicLogRequest(BaseModel):
+    metric_name: str = Field(..., description="Name of the metric (e.g., blood_sugar, blood_pressure)")
+    value: float = Field(..., description="Value of the metric")
+    unit: str = Field(..., description="Unit of the metric (e.g., mg/dL, mmHg)")
 
-class ChronicReading(BaseModel):
-    metric: str          # e.g. "blood_sugar"
-    value: float
-    unit: str
-    timestamp: str        # ISO 8601
-
-
-class ChronicTrendResponse(BaseModel):
-    metric: str
-    unhealthy_trend: bool
-    readings_considered: int
-    message: str
+class ChronicLogResponse(BaseModel):
+    trend_status: str = Field(..., description="Trend status: healthy, unhealthy, or insufficient_data")
+    message: str = Field(..., description="Explanation of the trend")
